@@ -1,0 +1,28 @@
+name: bim
+loading:
+  train:
+    batch_size: 9
+    num_workers: ${.batch_size}
+  val:
+    batch_size: ${..train.batch_size}
+    num_workers: ${.batch_size}
+# make sure train and val locations are at least 3m apart
+selection_subset_val: furthest # chooses samples based on furthest distance from training samples
+max_num_val: 500 # max number of validation samples
+drop_train_too_close_to_val: 1.0 # distance between training and val (originally 3.0 I changed to 1.0)
+# map data
+num_classes:
+  objects: 7
+pixel_per_meter: 56.9
+# crop_size_meters: 64
+max_init_error: 48 
+add_map_mask: true
+return_gps: false
+# preprocessing
+resize_image: 512
+pad_to_square: true
+rectify_pitch: true
+augmentation:
+  rot90: true
+  flip: true
+  image: {apply: true}

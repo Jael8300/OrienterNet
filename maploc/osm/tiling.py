@@ -1,0 +1,250 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+import io
+import pickle
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import os
+import numpy as np
+import rtree
+from PIL import Image
+
+from ..utils.geo import BoundaryBox, Projection
+from .data import MapData
+from .download import get_osm
+from .parser import Groups, BIMGroups
+from .raster import Canvas, render_raster_map, render_raster_masks
+from .reader import OSMData, OSMNode, OSMWay
+
+
+class MapIndex:
+    def __init__(
+        self,
+        data: MapData,
+    ):
+        self.index_nodes = rtree.index.Index()
+        for i, node in data.nodes.items():
+            self.index_nodes.insert(i, tuple(node.xy) * 2)
+
+        self.index_lines = rtree.index.Index()
+        for i, line in data.lines.items():
+            bbox = tuple(np.r_[line.xy.min(0), line.xy.max(0)])
+            self.index_lines.insert(i, bbox)
+
+        self.index_areas = rtree.index.Index()
+        for i, area in data.areas.items():
+            xy = np.concatenate(area.outers + area.inners)
+            bbox = tuple(np.r_[xy.min(0), xy.max(0)])
+            self.index_areas.insert(i, bbox)
+
+        self.data = data
+
+    def query(self, bbox: BoundaryBox) -> Tuple[List[OSMNode], List[OSMWay]]:
+        query = tuple(np.r_[bbox.min_, bbox.max_])
+        ret = []
+        for x in ["nodes", "lines", "areas"]:
+            ids = getattr(self, "index_" + x).intersection(query)
+            ret.append([getattr(self.data, x)[i] for i in ids])
+        return tuple(ret)
+
+
+def bbox_to_slice(bbox: BoundaryBox, canvas: Canvas):
+    uv_min = np.ceil(canvas.to_uv(bbox.min_)).astype(int)
+    uv_max = np.ceil(canvas.to_uv(bbox.max_)).astype(int)
+    slice_ = (slice(uv_max[1], uv_min[1]), slice(uv_min[0], uv_max[0]))
+    return slice_
+
+
+def round_bbox(bbox: BoundaryBox, origin: np.ndarray, ppm: int):
+    bbox = bbox.translate(-origin)
+    bbox = BoundaryBox(np.round(bbox.min_ * ppm) / ppm, np.round(bbox.max_ * ppm) / ppm)
+    return bbox.translate(origin)
+
+
+class TileManager:
+    def __init__(
+        self,
+        tiles: Dict,
+        bbox: BoundaryBox,
+        tile_size: int,
+        ppm: int,
+        #projection: Projection,
+        groups: Dict[str, List[str]],
+        map_data: Optional[MapData] = None,
+    ):
+        self.origin = bbox.min_
+        self.bbox = bbox
+        self.tiles = tiles
+        self.tile_size = tile_size
+        self.ppm = ppm
+        #self.projection = projection
+        self.groups = groups
+        self.map_data = map_data
+        assert np.all(tiles[0, 0].bbox.min_ == self.origin)
+        for tile in tiles.values():
+            assert bbox.contains(tile.bbox)
+
+    @classmethod
+    def from_bbox(
+        cls,
+        projection: Projection,
+        bbox: BoundaryBox,  # bounding box defining area of interest in projection coordinate system
+        ppm: int,   # pixel per meter - resolution of resulting tiles
+        path: Optional[Path] = None,
+        tile_size: int = 128,
+    ):
+        bbox_osm = projection.unproject(bbox)
+        if path is not None and path.is_file():
+            osm = OSMData.from_file(path) #TODO: edit OSMData
+            if osm.box is not None:
+                assert osm.box.contains(bbox_osm)
+        else:
+            print(f"osm_path is empty. maploc/osm/tiling.py")
+            # osm = OSMData.from_dict(get_osm(bbox_osm, path))
+
+        osm.add_xy_to_nodes(projection)
+        map_data = MapData.from_osm(osm) #TODO: edit MapData
+        map_index = MapIndex(map_data) #TODO: edit MapIndex
+
+        bounds_x, bounds_y = [
+            np.r_[np.arange(min_, max_, tile_size), max_]
+            for min_, max_ in zip(bbox.min_, bbox.max_)
+        ]
+        bbox_tiles = {}
+        for i, xmin in enumerate(bounds_x[:-1]):
+            for j, ymin in enumerate(bounds_y[:-1]):
+                bbox_tiles[i, j] = BoundaryBox(
+                    [xmin, ymin], [bounds_x[i + 1], bounds_y[j + 1]]
+                )
+
+        tiles = {}
+        for ij, bbox_tile in bbox_tiles.items():
+            canvas = Canvas(bbox_tile, ppm)
+            nodes, lines, areas = map_index.query(bbox_tile)
+            masks = render_raster_masks(nodes, lines, areas, canvas)
+            canvas.raster = render_raster_map(masks)
+            tiles[ij] = canvas
+
+        groups = {k: v for k, v in vars(Groups).items() if not k.startswith("__")}
+
+        return cls(tiles, bbox, tile_size, ppm, projection, groups, map_data)
+    
+    @classmethod
+    def from_bbbox(
+        cls,
+        projection: Projection,
+        bbox: BoundaryBox,  # bounding box defining area of interest in projection coordinate system
+        ppm: int,   # pixel per meter - resolution of resulting tiles
+        # path: Optional[Path] = None,
+        image_dir: Path, # Directory where tile images are stored
+        tile_size: int = 128,
+    ):
+        bounds_x, bounds_y = [
+            np.r_[np.arange(min_, max_, tile_size), max_]
+            for min_, max_ in zip(bbox.min_, bbox.max_)
+        ]
+        
+        tiles = {}
+        for i, xmin in enumerate(bounds_x[:-1]):
+            for j, ymin in enumerate(bounds_y[:-1]):
+                tile_bbox = BoundaryBox([xmin, ymin], [bounds_x[i + 1], bounds_y[j + 1]])
+                image_path = image_dir / f"tile_{i}_{j}.png"  # Path to the image for this tile
+                # Print statement here to track tile creation
+                print(f"Creating tile at index ({i}, {j}) with bounds {tile_bbox}")
+                tiles[(i, j)] = Canvas(tile_bbox, ppm, image_path)
+
+        groups = {k: v for k, v in vars(BIMGroups).items() if not k.startswith("__")}
+
+        return cls(tiles, bbox, tile_size, ppm, projection, groups)
+
+    def query(self, bbox: BoundaryBox) -> Canvas:
+        bbox = round_bbox(bbox, self.bbox.min_, self.ppm)
+        canvas = Canvas(bbox, self.ppm)
+        raster = np.zeros((3, canvas.h, canvas.w), np.uint8)
+
+        bbox_all = bbox & self.bbox
+        ij_min = np.floor((bbox_all.min_ - self.origin) / self.tile_size).astype(int)
+        ij_max = np.ceil((bbox_all.max_ - self.origin) / self.tile_size).astype(int) - 1
+        for i in range(ij_min[0], ij_max[0] + 1):
+            for j in range(ij_min[1], ij_max[1] + 1):
+                tile = self.tiles[i, j]
+                bbox_select = tile.bbox & bbox
+                slice_query = bbox_to_slice(bbox_select, canvas)
+                slice_tile = bbox_to_slice(bbox_select, tile)
+                raster[(slice(None),) + slice_query] = tile.raster[
+                    (slice(None),) + slice_tile
+                ]
+        canvas.raster = raster
+        return canvas
+
+    def save(self, path: Path):
+        dump = {
+            "bbox": self.bbox.format(),
+            "tile_size": self.tile_size,
+            "ppm": self.ppm,
+            "groups": self.groups,
+            "tiles_bbox": {},
+            "tiles_raster": {},
+        }
+        for ij, canvas in self.tiles.items():
+            dump["tiles_bbox"][ij] = canvas.bbox.format()
+            raster_bytes = io.BytesIO()
+            raster = Image.fromarray(canvas.raster.transpose(1, 2, 0).astype(np.uint8))
+            raster.save(raster_bytes, format="PNG")
+            raster_bytes.seek(0)
+            dump["tiles_raster"][ij] = raster_bytes.getvalue()  # save bytes
+        with open(path, "wb") as fp:
+            pickle.dump(dump, fp)
+
+
+
+    def save_png(self, path: Path, png_files: Dict[Tuple[int, int], Dict[str, Path]]):
+        dump = {
+            "bbox": self.bbox.format(),
+            "tile_size": self.tile_size,
+            "ppm": self.ppm,
+            "groups": self.groups,
+            "tiles_bbox": {},
+            "tiles_raster": {},
+        }
+        for ij, file_dict in png_files.items():
+            for output_name, png_path in file_dict.items():
+                print("Processing PNG file:", png_path)
+                # Store tile bounding box
+                dump["tiles_bbox"][ij] = self.tiles[ij].bbox.format()
+                # Read PNG file into memory
+                with open(png_path, "rb") as f:
+                    png_image = Image.open(f)
+                    # Convert PIL Image to bytes
+                    png_bytes = io.BytesIO()
+                    png_image.save(png_bytes, format="PNG")
+                    # Store PNG bytes in dump
+                    dump["tiles_raster"][ij] = png_bytes.getvalue()
+        with open(path, "wb") as fp:
+            pickle.dump(dump, fp)
+
+
+    @classmethod
+    def load(cls, path: Path):
+        with path.open("rb") as fp:
+            dump = pickle.load(fp)
+        tiles = {}
+        for ij, bbox_str in dump["tiles_bbox"].items():
+            bbox = BoundaryBox.from_string(bbox_str)
+            raster_bytes = io.BytesIO(dump["tiles_raster"][ij])
+            raster_image = Image.open(raster_bytes)
+            raster = np.asarray(raster_image)
+            raster = raster.transpose(2, 0, 1)  # Adjust based on your data format
+            canvas = Canvas(bbox, dump["ppm"])
+            canvas.raster = raster
+            tiles[ij] = canvas
+        # projection = Projection(*dump.get("ref_latlonalt", (None, None, None)))
+        return cls(
+            tiles,
+            BoundaryBox.from_string(dump["bbox"]),
+            dump["tile_size"],
+            dump["ppm"],
+            # projection,
+            dump["groups"],
+        )
